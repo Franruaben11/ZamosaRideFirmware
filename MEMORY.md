@@ -14,3 +14,4 @@
 
 ## Registro de Cambios Recientes
 - Se creó el archivo `README.md` documentando el hardware (ESP32-S3, AMOLED Waveshare 1.75"), pinout QSPI/I2C, UUIDs y especificación del payload JSON BLE, comandos de compilación/carga de PlatformIO y estructura del proyecto.
+- Se agregaron optimizaciones de ahorro de energía en `src/main.cpp`: brillo AMOLED adaptativo por estado (`255` en navegación, `160` en standby conectado, `60` en desconectado) con auto-apagado (`gfx->displayOff()`) tras 3 min desconectado y encendido inmediato ante actividad BLE; sleep dinámico en `loop()` mediante `xTaskNotifyGive`/`ulTaskNotifyTake` y `lv_timer_handler()`; escalado de frecuencia de CPU (`80 MHz` en standby, `160 MHz` en navegación); y parámetros BLE relajados (`min=40`, `max=80`, `latency=4`, `timeout=400`).

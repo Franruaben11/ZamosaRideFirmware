@@ -88,12 +88,13 @@ static uint32_t my_tick_get_cb(void) {
 // ============================================================================
 // 3. Configuración BLE (NimBLE) y Estado Sincronizado (Thread-Safe)
 // ============================================================================
-#define SERVICE_UUID            "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
-#define CHARACTERISTIC_UUID     "beb5483e-36e1-4688-b7f5-ea07361b26a8"
-#define BLE_MTU_SIZE            512
-#define MAX_ROUTE_POINTS        10
-#define BLE_DISCONNECT_GRACE_MS 3000U
-#define SECONDS_PER_DAY         86400U
+#define SERVICE_UUID                "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CHARACTERISTIC_UUID         "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+#define BLE_MTU_SIZE                512
+#define MAX_ROUTE_POINTS            10
+#define BLE_DISCONNECT_GRACE_MS     3000U
+#define DISCONNECTED_DISPLAY_OFF_MS 180000U
+#define SECONDS_PER_DAY             86400U
 
 enum UiState {
     UI_STATE_DISCONNECTED = 0,
@@ -111,6 +112,7 @@ struct TelemetryData {
 };
 
 static portMUX_TYPE state_mux = portMUX_INITIALIZER_UNLOCKED;
+static TaskHandle_t mainTaskHandle = nullptr;
 
 static TelemetryData shared_telemetry;
 static lv_point_precise_t shared_route_points[MAX_ROUTE_POINTS];
@@ -146,7 +148,11 @@ class ServerCallbacks : public NimBLEServerCallbacks {
         portEXIT_CRITICAL(&state_mux);
 
         Serial.printf("[BLE] Cliente conectado (handle: %d)\n", desc->conn_handle);
-        pServer->updateConnParams(desc->conn_handle, 12, 24, 0, 60);
+        pServer->updateConnParams(desc->conn_handle, 40, 80, 4, 400);
+
+        if (mainTaskHandle != nullptr) {
+            xTaskNotifyGive(mainTaskHandle);
+        }
     }
 
     void onDisconnect(NimBLEServer *pServer) override {
@@ -158,6 +164,10 @@ class ServerCallbacks : public NimBLEServerCallbacks {
 
         Serial.println("[BLE] Cliente desconectado, reiniciando advertising...");
         NimBLEDevice::startAdvertising();
+
+        if (mainTaskHandle != nullptr) {
+            xTaskNotifyGive(mainTaskHandle);
+        }
     }
 };
 
@@ -220,6 +230,10 @@ class TelemetryCharCallbacks : public NimBLECharacteristicCallbacks {
         }
         new_telemetry_available = true;
         portEXIT_CRITICAL(&state_mux);
+
+        if (mainTaskHandle != nullptr) {
+            xTaskNotifyGive(mainTaskHandle);
+        }
 
         Serial.printf(
             "[BLE->JSON] Maniobra:%d | DistMan:%dm | DistDest:%dm | Vel:%dkm/h | Prog:%d%% | Puntos:%u | Hora:%s\n",
@@ -350,6 +364,8 @@ void init_display_and_lvgl() {
 // ============================================================================
 static UiState current_ui_state = UI_STATE_DISCONNECTED;
 static int last_rendered_minute = -2;
+static uint32_t disconnected_state_entered_ms = 0;
+static bool display_is_off = false;
 
 // Widgets: Modo Standby Desconectado
 static lv_obj_t *lbl_disc_icon     = nullptr;
@@ -417,6 +433,25 @@ static void apply_ui_state(UiState new_state) {
     bool show_disc = (new_state == UI_STATE_DISCONNECTED);
     bool show_conn = (new_state == UI_STATE_CONNECTED_STANDBY);
     bool show_nav  = (new_state == UI_STATE_NAVIGATING);
+
+    // Escalado dinámico de frecuencia de CPU y gestión de brillo/encendido AMOLED
+    if (show_nav) {
+        setCpuFrequencyMhz(160);
+        gfx->displayOn();
+        display_is_off = false;
+        gfx->setBrightness(255);
+    } else if (show_conn) {
+        setCpuFrequencyMhz(80);
+        gfx->displayOn();
+        display_is_off = false;
+        gfx->setBrightness(160);
+    } else {
+        setCpuFrequencyMhz(80);
+        disconnected_state_entered_ms = millis();
+        gfx->displayOn();
+        display_is_off = false;
+        gfx->setBrightness(60);
+    }
 
     set_obj_visible(lbl_disc_icon, show_disc);
     set_obj_visible(lbl_disc_title, show_disc);
@@ -570,6 +605,8 @@ void setup() {
     delay(500);
     Serial.println("=== Iniciando ZamosaRide Firmware (ESP32-S3) ===");
 
+    mainTaskHandle = xTaskGetCurrentTaskHandle();
+
     init_ble();
     init_display_and_lvgl();
     init_ui();
@@ -592,6 +629,14 @@ void loop() {
         }
     }
     portEXIT_CRITICAL(&state_mux);
+
+    // Si el panel estaba apagado por inactividad, encenderlo inmediatamente ante onConnect o onWrite
+    if (display_is_off && (is_connected || has_new_telemetry)) {
+        gfx->displayOn();
+        gfx->setBrightness(60);
+        display_is_off = false;
+        disconnected_state_entered_ms = millis();
+    }
 
     // 1. Transición inmediata al conectar BLE desde estado desconectado
     if (is_connected && current_ui_state == UI_STATE_DISCONNECTED) {
@@ -625,11 +670,26 @@ void loop() {
         }
     }
 
-    // 4. Actualizar reloj local en Standby Conectado únicamente cuando cambie el minuto
+    // 4. Auto-apagado del panel AMOLED tras 3 minutos continuos en UI_STATE_DISCONNECTED
+    if (current_ui_state == UI_STATE_DISCONNECTED && !is_connected && !display_is_off) {
+        uint32_t elapsed_in_disc = (uint32_t)(millis() - disconnected_state_entered_ms);
+        if (elapsed_in_disc >= DISCONNECTED_DISPLAY_OFF_MS) {
+            gfx->displayOff();
+            display_is_off = true;
+        }
+    }
+
+    // 5. Actualizar reloj local en Standby Conectado únicamente cuando cambie el minuto
     if (current_ui_state == UI_STATE_CONNECTED_STANDBY) {
         update_standby_clock();
     }
 
-    lv_timer_handler();
-    delay(5);
+    uint32_t time_till_next = lv_timer_handler();
+
+    if (current_ui_state == UI_STATE_NAVIGATING) {
+        uint32_t wait_ms = min(time_till_next, (uint32_t)16);
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(wait_ms));
+    } else {
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(500));
+    }
 }
