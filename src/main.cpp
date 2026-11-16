@@ -4,7 +4,9 @@
 #include <lvgl.h>
 #include <NimBLEDevice.h>
 #include <ArduinoJson.h>
+#include <cmath>
 #include <cstdio>
+#include "icons/nav_icons.h"
 
 // En Arduino-ESP32 v3.3.x, initArduino() libera la memoria del controlador BLE (~36KB en 0x3fcef180)
 // al heap general salvo que bleInUse() / btInUse() devuelvan true. Sin esto, NimBLE corrompe el heap al iniciar.
@@ -108,6 +110,8 @@ struct TelemetryData {
     int distanciaDestino = 0;
     int velocidadActual = 0;
     int progresoViaje = 0;
+    int limiteVelocidad = 0;
+    int distanciaRadar = 0;
     size_t numPuntosRuta = 0;
 };
 
@@ -192,6 +196,8 @@ class TelemetryCharCallbacks : public NimBLECharacteristicCallbacks {
         parsed.distanciaDestino  = doc["distanciaDestino"] | 0;
         parsed.velocidadActual   = doc["velocidadActual"] | 0;
         parsed.progresoViaje     = doc["progresoViaje"] | 0;
+        parsed.limiteVelocidad   = doc["limiteVelocidad"] | 0;
+        parsed.distanciaRadar    = doc["distanciaRadar"] | 0;
 
         lv_point_precise_t parsed_points[MAX_ROUTE_POINTS];
         JsonArray puntos = doc["puntosRuta"].as<JsonArray>();
@@ -236,12 +242,14 @@ class TelemetryCharCallbacks : public NimBLECharacteristicCallbacks {
         }
 
         Serial.printf(
-            "[BLE->JSON] Maniobra:%d | DistMan:%dm | DistDest:%dm | Vel:%dkm/h | Prog:%d%% | Puntos:%u | Hora:%s\n",
+            "[BLE->JSON] Maniobra:%d | DistMan:%dm | DistDest:%dm | Vel:%dkm/h | Prog:%d%% | Radar:%d(%dm) | Puntos:%u | Hora:%s\n",
             parsed.tipoManiobra,
             parsed.distanciaManiobra,
             parsed.distanciaDestino,
             parsed.velocidadActual,
             parsed.progresoViaje,
+            parsed.limiteVelocidad,
+            parsed.distanciaRadar,
             (unsigned int)parsed.numPuntosRuta,
             doc["hora"] | "--:--"
         );
@@ -378,19 +386,100 @@ static lv_obj_t *lbl_conn_status = nullptr;
 static lv_obj_t *lbl_conn_clock  = nullptr;
 static lv_obj_t *lbl_conn_ready  = nullptr;
 
-// Widgets: Modo Navegación Activa
-static lv_obj_t *route_line    = nullptr;
-static lv_obj_t *lbl_maniobra  = nullptr;
-static lv_obj_t *lbl_velocidad = nullptr;
-static lv_obj_t *lbl_destino   = nullptr;
+// Widgets: Modo Navegación Activa (Estética minimalista tipo Beeline Moto II)
+static lv_style_t style_route;
+static lv_obj_t *route_line         = nullptr;
+static lv_obj_t *img_pilot          = nullptr;
+static lv_obj_t *img_maniobra       = nullptr;
+static lv_obj_t *lbl_distancia_num  = nullptr;
+static lv_obj_t *lbl_distancia_unit = nullptr;
+static lv_obj_t *arc_progreso       = nullptr;
+
+// Widgets: Alerta de Radar en Navegación Activa (Sector medio-izquierdo a las 9 en punto)
+static lv_obj_t *badge_radar        = nullptr;
+static lv_obj_t *lbl_radar_val      = nullptr;
+static lv_obj_t *lbl_radar_dist     = nullptr;
+
+// Proyecta puntosRuta para anclar puntosRuta[0] en (X: 233, Y: 255) y ampliar el minimapa en la mitad superior (Y: 12..255, ancho útil ~340 px)
+static void project_route_points(const lv_point_precise_t *raw_pts, size_t count, lv_point_precise_t *out_pts) {
+    if (count == 0) return;
+
+    const float anchor_x   = 233.0f;
+    const float anchor_y   = 255.0f;
+    const float min_y      = 12.0f;
+    const float max_y      = 255.0f;
+    const float half_width = 170.0f; // Ancho útil total de 340 px (X: 63..403)
+    const float min_x      = anchor_x - half_width;
+    const float max_x      = anchor_x + half_width;
+    const float usable_h   = anchor_y - min_y; // 243 px de recorrido vertical superior
+
+    float x0 = (float)raw_pts[0].x;
+    float y0 = (float)raw_pts[0].y;
+
+    out_pts[0].x = (lv_value_precise_t)anchor_x;
+    out_pts[0].y = (lv_value_precise_t)anchor_y;
+
+    if (count == 1) return;
+
+    float max_up = 0.0f;
+    float max_side = 0.0f;
+    for (size_t i = 1; i < count; ++i) {
+        float dx = (float)raw_pts[i].x - x0;
+        float dy = (float)raw_pts[i].y - y0;
+        if (dy < 0.0f && (-dy) > max_up) {
+            max_up = -dy;
+        }
+        float abs_dx = fabsf(dx);
+        if (abs_dx > max_side) {
+            max_side = abs_dx;
+        }
+    }
+
+    // Escalar para aprovechar el área de 340x243 px con mayor presencia visual en pantalla
+    float scale_y = (max_up > 1.0f) ? (usable_h / max_up) : 1.35f;
+    float scale_x = (max_side > 1.0f) ? (half_width / max_side) : 1.35f;
+    float scale = (scale_x < scale_y) ? scale_x : scale_y;
+    if (scale > 1.45f) {
+        scale = 1.45f;
+    }
+
+    for (size_t i = 1; i < count; ++i) {
+        float dx = (float)raw_pts[i].x - x0;
+        float dy = (float)raw_pts[i].y - y0;
+
+        float px = anchor_x + dx * scale;
+        float py = anchor_y + dy * scale;
+
+        if (px < min_x) px = min_x;
+        if (px > max_x) px = max_x;
+        if (py < min_y) py = min_y;
+        if (py > max_y) py = max_y;
+
+        out_pts[i].x = (lv_value_precise_t)lroundf(px);
+        out_pts[i].y = (lv_value_precise_t)lroundf(py);
+    }
+}
+
+static const lv_image_dsc_t *get_maneuver_icon(int tipo_maniobra) {
+    switch (tipo_maniobra) {
+        case 1:
+            return &icon_turn_left;   // 1: Doblar a la izquierda
+        case 2:
+            return &icon_turn_right;  // 2: Doblar a la derecha
+        case 3:
+            return &icon_straight;    // 3: Seguir derecho
+        case 4:
+            return &icon_finish;      // 4: Llegada a destino
+        case 5:
+            return &icon_uturn;       // 5: Retorno en U
+        default:
+            return &icon_straight;
+    }
+}
 
 static void set_obj_visible(lv_obj_t *obj, bool visible) {
     if (obj == nullptr) return;
-    if (visible) {
-        lv_obj_remove_flag(obj, LV_OBJ_FLAG_HIDDEN);
-    } else {
-        lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
-    }
+    lv_obj_set_hidden(obj, !visible);
 }
 
 static void update_standby_clock() {
@@ -463,9 +552,15 @@ static void apply_ui_state(UiState new_state) {
     set_obj_visible(lbl_conn_ready, show_conn);
 
     set_obj_visible(route_line, show_nav);
-    set_obj_visible(lbl_maniobra, show_nav);
-    set_obj_visible(lbl_velocidad, show_nav);
-    set_obj_visible(lbl_destino, show_nav);
+    set_obj_visible(img_pilot, show_nav);
+    set_obj_visible(img_maniobra, show_nav);
+    set_obj_visible(lbl_distancia_num, show_nav);
+    set_obj_visible(lbl_distancia_unit, show_nav);
+    set_obj_visible(arc_progreso, show_nav);
+
+    bool show_radar = show_nav && (current_telemetry.limiteVelocidad > 0 || current_telemetry.limiteVelocidad == -1);
+    set_obj_visible(badge_radar, show_radar);
+    set_obj_visible(lbl_radar_dist, show_radar);
 
     if (show_conn) {
         last_rendered_minute = -2; // Forzar actualización inmediata del reloj al entrar a Standby Conectado
@@ -487,7 +582,7 @@ void init_ui() {
 
     lbl_disc_title = lv_label_create(scr);
     lv_obj_set_style_text_font(lbl_disc_title, &lv_font_montserrat_24, LV_PART_MAIN);
-    lv_obj_set_style_text_color(lbl_disc_title, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+    lv_obj_set_style_text_color(lbl_disc_title, lv_color_hex(0xEDEBEB), LV_PART_MAIN);
     lv_label_set_text(lbl_disc_title, "ZAMOSARIDE");
     lv_obj_align(lbl_disc_title, LV_ALIGN_CENTER, 0, -18);
 
@@ -514,7 +609,7 @@ void init_ui() {
 
     lbl_conn_clock = lv_label_create(scr);
     lv_obj_set_style_text_font(lbl_conn_clock, &lv_font_montserrat_48, LV_PART_MAIN);
-    lv_obj_set_style_text_color(lbl_conn_clock, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+    lv_obj_set_style_text_color(lbl_conn_clock, lv_color_hex(0xEDEBEB), LV_PART_MAIN);
     lv_label_set_text(lbl_conn_clock, "--:--");
     lv_obj_align(lbl_conn_clock, LV_ALIGN_CENTER, 0, -6);
 
@@ -525,33 +620,87 @@ void init_ui() {
     lv_obj_align(lbl_conn_ready, LV_ALIGN_CENTER, 0, 56);
 
     // ------------------------------------------------------------------------
-    // 3. Modo Navegación Activa (Intacto)
+    // 3. Modo Navegación Activa (Estética Beeline Moto II - 3 Zonas sobre #000000)
     // ------------------------------------------------------------------------
+    // A. Zona Superior / Central: Mapa Vectorial (Y: 0..260) + Puntero Chevron
+    lv_style_init(&style_route);
+    lv_style_set_line_color(&style_route, lv_color_hex(0xEDEBEB));
+    lv_style_set_line_width(&style_route, 18);
+    lv_style_set_line_rounded(&style_route, true);
+
     route_line = lv_line_create(scr);
     lv_obj_set_pos(route_line, 0, 0);
-    lv_obj_set_style_line_width(route_line, 14, LV_PART_MAIN);
-    lv_obj_set_style_line_color(route_line, lv_color_hex(0x00E5FF), LV_PART_MAIN);
-    lv_obj_set_style_line_rounded(route_line, true, LV_PART_MAIN);
+    lv_obj_add_style(route_line, &style_route, LV_PART_MAIN);
     current_telemetry.numPuntosRuta = 0;
     lv_line_set_points(route_line, current_route_points, 0);
 
-    // Etiqueta superior: Maniobra y distancia a maniobra
-    lbl_maniobra = lv_label_create(scr);
-    lv_obj_set_style_text_color(lbl_maniobra, lv_color_white(), LV_PART_MAIN);
-    lv_label_set_text(lbl_maniobra, "Maniobra: -- (0 m)");
-    lv_obj_align(lbl_maniobra, LV_ALIGN_TOP_MID, 0, 28);
+    // Puntero del vehículo centrado en (X: 233, Y: 260) -> offset (0, +27) respecto al centro (233, 233)
+    img_pilot = lv_image_create(scr);
+    lv_image_set_src(img_pilot, &icon_chevron_pilot);
+    lv_obj_align(img_pilot, LV_ALIGN_CENTER, 0, 27);
 
-    // Etiqueta inferior izquierda/centro: Velocidad actual
-    lbl_velocidad = lv_label_create(scr);
-    lv_obj_set_style_text_color(lbl_velocidad, lv_color_hex(0x00FF88), LV_PART_MAIN);
-    lv_label_set_text(lbl_velocidad, "0 km/h");
-    lv_obj_align(lbl_velocidad, LV_ALIGN_BOTTOM_MID, 0, -52);
+    // B. Zona Inferior: Ícono de Maniobra + Distancia Apilada (Y: 295..395)
+    img_maniobra = lv_image_create(scr);
+    lv_image_set_src(img_maniobra, &icon_straight);
+    lv_obj_align(img_maniobra, LV_ALIGN_CENTER, -55, 110);
 
-    // Etiqueta inferior: Distancia a destino y progreso
-    lbl_destino = lv_label_create(scr);
-    lv_obj_set_style_text_color(lbl_destino, lv_color_hex(0xAAAAAA), LV_PART_MAIN);
-    lv_label_set_text(lbl_destino, "Dest: 0 m | 0%");
-    lv_obj_align(lbl_destino, LV_ALIGN_BOTTOM_MID, 0, -24);
+    lbl_distancia_num = lv_label_create(scr);
+    lv_obj_set_style_text_font(lbl_distancia_num, &lv_font_montserrat_48, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lbl_distancia_num, lv_color_hex(0xEDEBEB), LV_PART_MAIN);
+    lv_label_set_text(lbl_distancia_num, "0");
+    lv_obj_align(lbl_distancia_num, LV_ALIGN_CENTER, 35, 96);
+
+    lbl_distancia_unit = lv_label_create(scr);
+    lv_obj_set_style_text_font(lbl_distancia_unit, &lv_font_montserrat_24, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lbl_distancia_unit, lv_color_hex(0xCCCCCC), LV_PART_MAIN);
+    lv_label_set_text(lbl_distancia_unit, "m");
+    lv_obj_align_to(lbl_distancia_unit, lbl_distancia_num, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 2);
+
+    // C. Borde Curvo Inferior: Barra de Progreso (lv_arc 420x420, ángulos 55° a 125°)
+    arc_progreso = lv_arc_create(scr);
+    lv_obj_set_size(arc_progreso, 420, 420);
+    lv_obj_align(arc_progreso, LV_ALIGN_CENTER, 0, 0);
+    lv_arc_set_bg_angles(arc_progreso, 55, 125);
+    lv_arc_set_range(arc_progreso, 0, 100);
+    lv_arc_set_value(arc_progreso, 0);
+    lv_obj_remove_style(arc_progreso, NULL, LV_PART_KNOB);
+    lv_obj_set_clickable(arc_progreso, false);
+
+    lv_obj_set_style_arc_width(arc_progreso, 5, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(arc_progreso, lv_color_hex(0x333333), LV_PART_MAIN);
+    lv_obj_set_style_arc_rounded(arc_progreso, true, LV_PART_MAIN);
+
+    lv_obj_set_style_arc_width(arc_progreso, 5, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(arc_progreso, lv_color_hex(0xEDEBEB), LV_PART_INDICATOR);
+    lv_obj_set_style_arc_rounded(arc_progreso, true, LV_PART_INDICATOR);
+
+    // D. Alerta de Radar: Sector medio-izquierdo a las 9 en punto (X: 85, Y: 223)
+    badge_radar = lv_obj_create(scr);
+    lv_obj_set_size(badge_radar, 84, 84);
+    lv_obj_align(badge_radar, LV_ALIGN_CENTER, -148, -30);
+    lv_obj_set_style_radius(badge_radar, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(badge_radar, lv_color_hex(0xEDEBEB), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(badge_radar, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_color(badge_radar, lv_color_hex(0xE51C23), LV_PART_MAIN);
+    lv_obj_set_style_border_width(badge_radar, 8, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(badge_radar, 0, LV_PART_MAIN);
+    lv_obj_set_scrollable(badge_radar, false);
+    lv_obj_set_clickable(badge_radar, false);
+
+    lbl_radar_val = lv_label_create(badge_radar);
+    lv_obj_set_style_text_font(lbl_radar_val, &lv_font_montserrat_28, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lbl_radar_val, lv_color_hex(0x000000), LV_PART_MAIN);
+    lv_label_set_text(lbl_radar_val, "60");
+    lv_obj_center(lbl_radar_val);
+
+    lbl_radar_dist = lv_label_create(scr);
+    lv_obj_set_style_text_font(lbl_radar_dist, &lv_font_montserrat_28, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lbl_radar_dist, lv_color_hex(0xEDEBEB), LV_PART_MAIN);
+    lv_label_set_text(lbl_radar_dist, "0 m");
+    lv_obj_align_to(lbl_radar_dist, badge_radar, LV_ALIGN_OUT_BOTTOM_MID, 0, 6);
+
+    set_obj_visible(badge_radar, false);
+    set_obj_visible(lbl_radar_dist, false);
 
     // Iniciar en estado desconectado (o conectado si BLE enlazó durante el arranque)
     bool initially_connected = false;
@@ -567,26 +716,62 @@ void update_ui() {
         lv_line_set_points(route_line, current_route_points, current_telemetry.numPuntosRuta);
     }
 
-    if (lbl_maniobra != nullptr) {
-        lv_label_set_text_fmt(
-            lbl_maniobra,
-            "Maniobra %d: %d m",
-            current_telemetry.tipoManiobra,
-            current_telemetry.distanciaManiobra
-        );
+    if (img_maniobra != nullptr) {
+        lv_image_set_src(img_maniobra, get_maneuver_icon(current_telemetry.tipoManiobra));
     }
 
-    if (lbl_velocidad != nullptr) {
-        lv_label_set_text_fmt(lbl_velocidad, "%d km/h", current_telemetry.velocidadActual);
+    if (lbl_distancia_num != nullptr && lbl_distancia_unit != nullptr) {
+        int dist_m = current_telemetry.distanciaManiobra;
+        if (dist_m < 0) dist_m = 0;
+
+        if (dist_m >= 1000) {
+            int km_int = dist_m / 1000;
+            int km_dec = (dist_m % 1000) / 100;
+            lv_label_set_text_fmt(lbl_distancia_num, "%d.%d", km_int, km_dec);
+            lv_label_set_text(lbl_distancia_unit, "km");
+        } else {
+            lv_label_set_text_fmt(lbl_distancia_num, "%d", dist_m);
+            lv_label_set_text(lbl_distancia_unit, "m");
+        }
+        lv_obj_align_to(lbl_distancia_unit, lbl_distancia_num, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 2);
     }
 
-    if (lbl_destino != nullptr) {
-        lv_label_set_text_fmt(
-            lbl_destino,
-            "Dest: %d m | %d%%",
-            current_telemetry.distanciaDestino,
-            current_telemetry.progresoViaje
-        );
+    if (arc_progreso != nullptr) {
+        int prog = current_telemetry.progresoViaje;
+        if (prog < 0) prog = 0;
+        if (prog > 100) prog = 100;
+        lv_arc_set_value(arc_progreso, prog);
+    }
+
+    if (badge_radar != nullptr && lbl_radar_val != nullptr && lbl_radar_dist != nullptr) {
+        int limite = current_telemetry.limiteVelocidad;
+        int dist_radar = current_telemetry.distanciaRadar;
+        if (dist_radar < 0) dist_radar = 0;
+
+        if (limite > 0) {
+            lv_obj_set_style_text_font(lbl_radar_val, &lv_font_montserrat_28, LV_PART_MAIN);
+            lv_label_set_text_fmt(lbl_radar_val, "%d", limite);
+            lv_obj_center(lbl_radar_val);
+
+            lv_label_set_text_fmt(lbl_radar_dist, "%d m", dist_radar);
+            lv_obj_align_to(lbl_radar_dist, badge_radar, LV_ALIGN_OUT_BOTTOM_MID, 0, 6);
+
+            set_obj_visible(badge_radar, true);
+            set_obj_visible(lbl_radar_dist, true);
+        } else if (limite == -1) {
+            lv_obj_set_style_text_font(lbl_radar_val, &lv_font_montserrat_16, LV_PART_MAIN);
+            lv_label_set_text(lbl_radar_val, "RADAR");
+            lv_obj_center(lbl_radar_val);
+
+            lv_label_set_text_fmt(lbl_radar_dist, "%d m", dist_radar);
+            lv_obj_align_to(lbl_radar_dist, badge_radar, LV_ALIGN_OUT_BOTTOM_MID, 0, 6);
+
+            set_obj_visible(badge_radar, true);
+            set_obj_visible(lbl_radar_dist, true);
+        } else {
+            set_obj_visible(badge_radar, false);
+            set_obj_visible(lbl_radar_dist, false);
+        }
     }
 }
 
@@ -595,6 +780,11 @@ static void clear_navigation_telemetry() {
     if (route_line != nullptr) {
         lv_line_set_points(route_line, current_route_points, 0);
     }
+    if (arc_progreso != nullptr) {
+        lv_arc_set_value(arc_progreso, 0);
+    }
+    set_obj_visible(badge_radar, false);
+    set_obj_visible(lbl_radar_dist, false);
 }
 
 // ============================================================================
@@ -617,6 +807,8 @@ void loop() {
     uint32_t disconnected_since = 0;
     bool has_new_telemetry = false;
 
+    lv_point_precise_t raw_route_points[MAX_ROUTE_POINTS];
+
     portENTER_CRITICAL(&state_mux);
     is_connected = ble_is_connected;
     disconnected_since = ble_disconnected_since_ms;
@@ -625,10 +817,14 @@ void loop() {
         has_new_telemetry = true;
         current_telemetry = shared_telemetry;
         for (size_t i = 0; i < current_telemetry.numPuntosRuta; ++i) {
-            current_route_points[i] = shared_route_points[i];
+            raw_route_points[i] = shared_route_points[i];
         }
     }
     portEXIT_CRITICAL(&state_mux);
+
+    if (has_new_telemetry && current_telemetry.numPuntosRuta > 0) {
+        project_route_points(raw_route_points, current_telemetry.numPuntosRuta, current_route_points);
+    }
 
     // Si el panel estaba apagado por inactividad, encenderlo inmediatamente ante onConnect o onWrite
     if (display_is_off && (is_connected || has_new_telemetry)) {
